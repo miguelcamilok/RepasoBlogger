@@ -10,14 +10,4 @@ use App\Traits\CrudTrait;
 class RoleController extends Controller
 {
     use CrudTrait;
-
-    public function __construct(RoleServiceImpl $RoleService)
-    {
-        $this->configureCrud(
-            service: $RoleService,
-            storeRequest: StoreRoleRequest::class,
-            updateRequest: UpdateRoleRequest::class,
-            resourceName: 'Role'
-        );
-    }
 }

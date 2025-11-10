@@ -10,14 +10,4 @@ use App\Traits\CrudTrait;
 class CategoryController extends Controller
 {
     use CrudTrait;
-
-    public function __construct(CategoryServiceImpl $CategoryService)
-    {
-        $this->configureCrud(
-            service: $CategoryService,
-            storeRequest: StoreCategoryRequest::class,
-            updateRequest: UpdateCategoryRequest::class,
-            resourceName: 'Category'
-        );
-    }
 }

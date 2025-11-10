@@ -10,14 +10,4 @@ use App\Traits\CrudTrait;
 class MessageController extends Controller
 {
     use CrudTrait;
-
-    public function __construct(MessageServiceImpl $MessageService)
-    {
-        $this->configureCrud(
-            service: $MessageService,
-            storeRequest: StoreMessageRequest::class,
-            updateRequest: UpdateMessageRequest::class,
-            resourceName: 'Message'
-        );
-    }
 }
