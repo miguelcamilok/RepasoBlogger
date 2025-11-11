@@ -1,76 +1,73 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Traits;
 
-use Illuminate\Http\Request;
-use Illuminate\Http\JsonResponse;
-use Illuminate\Support\Facades\Schema;
-use Illuminate\Database\Eloquent\Model;
-use Illuminate\Support\Facades\Validator;
-use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\DB;
 use Exception;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\{Cache, DB, Log, Schema, Validator};
+use Illuminate\Validation\ValidationException;
+use ReflectionMethod;
+use Throwable;
 
+/**
+ * Trait CrudTrait
+ *
+ * Proporciona operaciones CRUD completas para controladores de Laravel con:
+ * - Detección automática de modelos
+ * - Integración opcional con HasSmartScopes
+ * - Soporte para relaciones many-to-many
+ * - Validación automática de campos
+ * - Manejo consistente de errores
+ * - Transacciones automáticas
+ *
+ * @property object|null $service Servicio opcional para lógica de negocio
+ * @property string|null $storeRequest FormRequest para validación en store
+ * @property string|null $updateRequest FormRequest para validación en update
+ * @property string|null $resourceName Nombre del recurso (detectado automáticamente)
+ * @property bool $applySmartScopes Habilitar scopes automáticos en index
+ */
 trait CrudTrait
 {
-    /**
-     * Servicio que maneja la lógica de negocio (opcional)
-     * 
-     * @var object|null
-     */
+    // ==================== CONFIGURACIÓN ====================
+
+    private const CACHE_DURATION_RELATIONS = 3600;
+    private const CACHE_DURATION_COLUMNS = 3600;
+
+    private const EXCLUDED_SYSTEM_FIELDS = [
+        'id',
+        'created_at',
+        'updated_at',
+        'deleted_at',
+    ];
+
+    private const EXCLUDED_RELATION_METHODS = [
+        'notifications',
+        'toArray',
+        'toJson',
+        'save',
+        'delete',
+        'update',
+        'fill',
+        'fresh',
+        'load',
+        'refresh',
+    ];
+
     protected ?object $service = null;
-
-    /**
-     * Request de validación para store (opcional)
-     * 
-     * @var string|null
-     */
     protected ?string $storeRequest = null;
-
-    /**
-     * Request de validación para update (opcional)
-     * 
-     * @var string|null
-     */
     protected ?string $updateRequest = null;
-
-    /**
-     * Nombre del recurso para mensajes y detección del modelo
-     * 
-     * @var string|null
-     */
     protected ?string $resourceName = null;
-
-    /**
-     * Instancia del modelo detectado automáticamente
-     * 
-     * @var string|null
-     */
     protected ?string $modelClass = null;
-
-    /**
-     * Habilitar aplicación automática de scopes en index
-     * 
-     * @var bool
-     */
     protected bool $applySmartScopes = true;
 
-    /**
-     * SOLUCIÓN: Obtiene la clase del modelo, inicializándola si es necesario
-     * Este método se llama en cada operación para asegurar que el modelo esté disponible
-     */
-    protected function getModelClass(): string
-    {
-        if ($this->modelClass === null) {
-            $this->resourceName = $this->resourceName ?? $this->detectResourceName();
-            $this->modelClass = $this->detectModel();
-        }
-        
-        return $this->modelClass;
-    }
+    // ==================== CONFIGURACIÓN PÚBLICA ====================
 
     /**
-     * Configura el trait con opciones personalizadas
+     * Configura el trait con opciones personalizadas.
      */
     public function configureCrud(
         ?object $service = null,
@@ -84,28 +81,229 @@ trait CrudTrait
         $this->updateRequest = $updateRequest;
         $this->resourceName = $resourceName;
         $this->applySmartScopes = $applySmartScopes;
-        
-        // Forzar inicialización del modelo si se proporciona resourceName
+
         if ($resourceName !== null) {
-            $this->modelClass = $this->detectModel();
+            $this->modelClass = $this->detectModelClass();
+        }
+    }
+
+    // ==================== OPERACIONES CRUD PÚBLICAS ====================
+
+    /**
+     * Lista todos los registros con soporte completo para HasSmartScopes.
+     *
+     * Ejemplos:
+     * - GET /api/resource
+     * - GET /api/resource?included=author,comments
+     * - GET /api/resource?filter[status]=active&sort=-created_at
+     */
+    public function index(Request $request): JsonResponse
+    {
+        try {
+            // Usar servicio si está configurado
+            if ($this->hasServiceMethod('all')) {
+                return $this->successResponse(
+                    $this->service->all(),
+                    "{$this->getResourceName()} obtenidos correctamente"
+                );
+            }
+
+            $query = $this->createModelQuery();
+
+            // Aplicar scopes inteligentes si están disponibles
+            if ($this->shouldApplySmartScopes()) {
+                $query = $this->applySmartScopes($query);
+            }
+
+            $data = $this->executeQueryWithPagination($query);
+
+            return $this->successResponse(
+                $data,
+                "{$this->getResourceName()} obtenidos correctamente"
+            );
+
+        } catch (Exception $e) {
+            return $this->errorResponse($e);
         }
     }
 
     /**
-     * Detecta el nombre del recurso desde el nombre del controlador
+     * Muestra un registro específico con soporte para included.
+     *
+     * Ejemplo:
+     * - GET /api/resource/1?included=author,comments
      */
-    protected function detectResourceName(): string
+    public function show(string|int $id): JsonResponse
     {
-        $className = class_basename(get_class($this));
+        try {
+            $query = $this->createModelQuery();
+
+            // Aplicar relaciones si están disponibles
+            if ($this->shouldApplyIncludedScope()) {
+                $query->included();
+            }
+
+            $record = $query->find($id);
+
+            if ($record === null) {
+                return $this->notFoundResponse();
+            }
+
+            return $this->successResponse(
+                $record,
+                "{$this->getResourceName()} obtenido correctamente"
+            );
+
+        } catch (Exception $e) {
+            return $this->errorResponse($e);
+        }
+    }
+
+    /**
+     * Crea un nuevo registro con soporte para relaciones many-to-many.
+     */
+    public function store(Request $request): JsonResponse
+    {
+        DB::beginTransaction();
+
+        try {
+            $validated = $this->validateRequest($request, 'store');
+            $relationData = $this->extractManyToManyRelations($validated);
+
+            // Crear registro usando servicio o directamente
+            $record = $this->hasServiceMethod('create')
+                ? $this->service->create($validated)
+                : $this->createRecord($validated);
+
+            // Sincronizar relaciones many-to-many
+            $this->syncManyToManyRelations($record, $relationData);
+
+            DB::commit();
+
+            // Recargar con relaciones
+            $record = $this->reloadRecordWithRelations($record, $relationData);
+
+            return $this->successResponse(
+                $record,
+                "{$this->getResourceName()} creado correctamente",
+                201
+            );
+
+        } catch (ValidationException $e) {
+            DB::rollBack();
+            return $this->validationErrorResponse($e);
+
+        } catch (Exception $e) {
+            DB::rollBack();
+            return $this->errorResponse($e);
+        }
+    }
+
+    /**
+     * Actualiza un registro existente con soporte para relaciones many-to-many.
+     */
+    public function update(Request $request, string|int $id): JsonResponse
+    {
+        DB::beginTransaction();
+
+        try {
+            $record = $this->findRecordOrFail($id);
+            $validated = $this->validateRequest($request, 'update');
+            $relationData = $this->extractManyToManyRelations($validated);
+
+            // Actualizar registro usando servicio o directamente
+            if ($this->hasServiceMethod('update')) {
+                $record = $this->service->update($record, $validated);
+            } else {
+                $record->update($validated);
+            }
+
+            // Sincronizar relaciones many-to-many
+            $this->syncManyToManyRelations($record, $relationData);
+
+            DB::commit();
+
+            // Recargar con relaciones
+            $record = $this->reloadRecordWithRelations($record, $relationData);
+
+            return $this->successResponse(
+                $record,
+                "{$this->getResourceName()} actualizado correctamente"
+            );
+
+        } catch (ValidationException $e) {
+            DB::rollBack();
+            return $this->validationErrorResponse($e);
+
+        } catch (Exception $e) {
+            DB::rollBack();
+            return $this->errorResponse($e);
+        }
+    }
+
+    /**
+     * Elimina un registro con detach automático de relaciones many-to-many.
+     */
+    public function destroy(string|int $id): JsonResponse
+    {
+        DB::beginTransaction();
+
+        try {
+            $record = $this->findRecordOrFail($id);
+
+            // Detach relaciones many-to-many antes de eliminar
+            $this->detachAllManyToManyRelations($record);
+
+            // Eliminar usando servicio o directamente
+            $this->hasServiceMethod('delete')
+                ? $this->service->delete($record)
+                : $record->delete();
+
+            DB::commit();
+
+            return $this->successResponse(
+                null,
+                "{$this->getResourceName()} eliminado correctamente"
+            );
+
+        } catch (Exception $e) {
+            DB::rollBack();
+            return $this->errorResponse($e);
+        }
+    }
+
+    // ==================== MÉTODOS PRIVADOS: MODELO ====================
+
+    /**
+     * Obtiene la clase del modelo, inicializándola si es necesario.
+     */
+    private function getModelClass(): string
+    {
+        if ($this->modelClass === null) {
+            $this->resourceName = $this->resourceName ?? $this->detectResourceName();
+            $this->modelClass = $this->detectModelClass();
+        }
+
+        return $this->modelClass;
+    }
+
+    /**
+     * Detecta el nombre del recurso desde el nombre del controlador.
+     */
+    private function detectResourceName(): string
+    {
+        $className = class_basename(static::class);
         return str_replace('Controller', '', $className);
     }
 
     /**
-     * Detecta y retorna la clase del modelo
+     * Detecta y valida la clase del modelo.
+     *
+     * @throws Exception Si el modelo no existe
      */
-    protected function detectModel(): string
+    private function detectModelClass(): string
     {
-        $modelName = $this->resourceName ?? $this->detectResourceName();
+        $modelName = $this->getResourceName();
         $modelClass = "App\\Models\\{$modelName}";
 
         if (!class_exists($modelClass)) {
@@ -116,532 +314,509 @@ trait CrudTrait
     }
 
     /**
-     * Lista todos los registros con soporte completo para HasSmartScopes
+     * Crea una nueva instancia de query del modelo.
      */
-    public function index(Request $request): JsonResponse
+    private function createModelQuery()
     {
-        try {
-            $modelClass = $this->getModelClass();
-            $query = app($modelClass)->newQuery();
-            if ($this->service && method_exists($this->service, 'all')) {
-                $data = $this->service->all();
-                
-                return response()->json([
-                    'success' => true,
-                    'message' => "{$this->resourceName} obtenidos correctamente",
-                    'data' => $data
-                ], 200);
-            }
-
-            // Si hay servicio configurado con método all, usarlo
-            if ($this->service && method_exists($this->service, 'all')) {
-                $data = $this->service->all();
-                
-                return response()->json([
-                    'success' => true,
-                    'message' => "{$this->resourceName} obtenidos correctamente",
-                    'data' => $data
-                ], 200);
-            }
-
-            // Crear query base
-
-            // Aplicar scopes inteligentes si está habilitado
-            if ($this->applySmartScopes && $this->modelHasSmartScopes($modelClass)) {
-                $query->included()
-                      ->filter()
-                      ->sort()
-                      ->search()
-                      ->fields()
-                      ->dateFilter();
-            }
-
-            // Obtener datos con paginación inteligente
-            $data = $this->modelHasSmartScopes($modelClass) && method_exists($modelClass, 'scopeGetOrPaginate')
-                ? $query->getOrPaginate()
-                : $query->get();
-
-            return response()->json([
-                'success' => true,
-                'message' => "{$this->resourceName} obtenidos correctamente",
-                'data' => $data
-            ], 200);
-
-        } catch (Exception $e) {
-            return $this->handleError($e);
-        }
+        $modelClass = $this->getModelClass();
+        return app($modelClass)->newQuery();
     }
 
     /**
-     * Muestra un registro específico con soporte para included
+     * Crea un nuevo registro en la base de datos.
      */
-    public function show($id): JsonResponse
+    private function createRecord(array $validated): Model
     {
-        try {
-            $modelClass = $this->getModelClass();
-            $query = app($modelClass)->newQuery();
+        $modelClass = $this->getModelClass();
+        $record = new $modelClass();
+        $record->fill($validated);
+        $record->save();
 
-            // Aplicar relaciones si están disponibles
-            if ($this->applySmartScopes && $this->modelHasSmartScopes($modelClass) && request()->has('included')) {
-                $query->included();
-            }
-
-            $record = $query->find($id);
-
-            if (!$record) {
-                return response()->json([
-                    'success' => false,
-                    'message' => "{$this->resourceName} no encontrado"
-                ], 404);
-            }
-
-            return response()->json([
-                'success' => true,
-                'message' => "{$this->resourceName} obtenido correctamente",
-                'data' => $record
-            ], 200);
-
-        } catch (Exception $e) {
-            return $this->handleError($e);
-        }
+        return $record;
     }
 
     /**
-     * Crea un nuevo registro con soporte para relaciones N:M
+     * Busca un registro por ID o lanza excepción 404.
+     *
+     * @throws Exception Si no se encuentra el registro
      */
-    public function store(Request $request): JsonResponse
+    private function findRecordOrFail(string|int $id): Model
     {
-        DB::beginTransaction();
-        
-        try {
-            $modelClass = $this->getModelClass();
-            
-            // Validar datos
-            $validated = $this->validateRequest($request, 'store');
+        $record = $this->createModelQuery()->find($id);
 
-            // Separar relaciones many-to-many ANTES de crear el registro
-            $relationData = $this->extractRelationData($validated, $modelClass);
-
-            // Si hay servicio con método create, usarlo
-            if ($this->service && method_exists($this->service, 'create')) {
-                $record = $this->service->create($validated);
-            } else {
-                // SOLUCIÓN DEFINITIVA: Crear instancia con conexión y guardar
-                // $validated ya NO tiene las relaciones, solo campos de la tabla
-                $record = new $modelClass();
-                $record->fill($validated);
-                $record->save();
-            }
-
-            // Sincronizar relaciones many-to-many DESPUÉS de crear el registro
-            if (!empty($relationData)) {
-                $this->syncRelations($record, $relationData);
-            }
-
-            DB::commit();
-
-            // Recargar el registro con las relaciones
-            if ($this->applySmartScopes && $this->modelHasSmartScopes($modelClass) && request()->has('included')) {
-                $record = app($modelClass)->newQuery()
-                    ->included()
-                    ->find($record->id);
-            } else {
-                // Recargar con todas las relaciones many-to-many
-                $manyToManyRelations = array_keys($relationData);
-                if (!empty($manyToManyRelations)) {
-                    $record = $record->load($manyToManyRelations);
-                } else {
-                    $record = $record->fresh();
-                }
-            }
-
-            return response()->json([
-                'success' => true,
-                'message' => "{$this->resourceName} creado correctamente",
-                'data' => $record
-            ], 201);
-
-        } catch (\Illuminate\Validation\ValidationException $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Error de validación',
-                'errors' => $e->errors()
-            ], 422);
-
-        } catch (Exception $e) {
-            DB::rollBack();
-            return $this->handleError($e);
+        if ($record === null) {
+            throw new Exception("{$this->getResourceName()} no encontrado", 404);
         }
+
+        return $record;
     }
 
     /**
-     * Actualiza un registro existente con soporte para relaciones N:M
+     * Obtiene el nombre del recurso con lazy initialization.
      */
-    public function update(Request $request, $id): JsonResponse
+    private function getResourceName(): string
     {
-        DB::beginTransaction();
-        
-        try {
-            $modelClass = $this->getModelClass();
-            $record = app($modelClass)->newQuery()->find($id);
-
-            if (!$record) {
-                return response()->json([
-                    'success' => false,
-                    'message' => "{$this->resourceName} no encontrado"
-                ], 404);
-            }
-
-            // Validar datos
-            $validated = $this->validateRequest($request, 'update');
-
-            // Separar relaciones many-to-many de los datos principales
-            $relationData = $this->extractRelationData($validated, $modelClass);
-
-            // Si hay servicio con método update, usarlo
-            if ($this->service && method_exists($this->service, 'update')) {
-                $record = $this->service->update($record, $validated);
-            } else {
-                // Actualizar registro directamente
-                $record->update($validated);
-            }
-
-            // Sincronizar relaciones many-to-many
-            if (!empty($relationData)) {
-                $this->syncRelations($record, $relationData);
-            }
-
-            DB::commit();
-
-            // Recargar el registro con las relaciones
-            if ($this->applySmartScopes && $this->modelHasSmartScopes($modelClass) && request()->has('included')) {
-                $record = app($modelClass)->newQuery()
-                    ->included()
-                    ->find($record->id);
-            } else {
-                // Recargar con todas las relaciones many-to-many
-                $manyToManyRelations = array_keys($relationData);
-                if (!empty($manyToManyRelations)) {
-                    $record = $record->load($manyToManyRelations);
-                } else {
-                    $record = $record->fresh();
-                }
-            }
-
-            return response()->json([
-                'success' => true,
-                'message' => "{$this->resourceName} actualizado correctamente",
-                'data' => $record
-            ], 200);
-
-        } catch (\Illuminate\Validation\ValidationException $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Error de validación',
-                'errors' => $e->errors()
-            ], 422);
-
-        } catch (Exception $e) {
-            DB::rollBack();
-            return $this->handleError($e);
+        if ($this->resourceName === null) {
+            $this->resourceName = $this->detectResourceName();
         }
+
+        return $this->resourceName;
     }
 
-    /**
-     * Elimina un registro
-     */
-    public function destroy($id): JsonResponse
-    {
-        DB::beginTransaction();
-        
-        try {
-            $modelClass = $this->getModelClass();
-            $record = app($modelClass)->newQuery()->find($id);
-
-            if (!$record) {
-                return response()->json([
-                    'success' => false,
-                    'message' => "{$this->resourceName} no encontrado"
-                ], 404);
-            }
-
-            // Detach todas las relaciones many-to-many antes de eliminar
-            $manyToManyRelations = $this->getManyToManyRelations($record);
-            foreach ($manyToManyRelations as $relation) {
-                try {
-                    $record->$relation()->detach();
-                } catch (\Exception $e) {
-                    Log::warning("No se pudo hacer detach de la relación {$relation}: " . $e->getMessage());
-                }
-            }
-
-            // Si hay servicio con método delete, usarlo
-            if ($this->service && method_exists($this->service, 'delete')) {
-                $this->service->delete($record);
-            } else {
-                $record->delete();
-            }
-
-            DB::commit();
-
-            return response()->json([
-                'success' => true,
-                'message' => "{$this->resourceName} eliminado correctamente"
-            ], 200);
-
-        } catch (Exception $e) {
-            DB::rollBack();
-            return $this->handleError($e);
-        }
-    }
+    // ==================== MÉTODOS PRIVADOS: SMART SCOPES ====================
 
     /**
-     * Verifica si el modelo tiene el trait HasSmartScopes
+     * Verifica si el modelo tiene el trait HasSmartScopes.
      */
-    protected function modelHasSmartScopes(string $modelClass): bool
+    private function modelHasSmartScopes(): bool
     {
+        $modelClass = $this->getModelClass();
         $traits = class_uses_recursive($modelClass);
-        
-        return in_array('App\Traits\HasSmartScopes', $traits) ||
-               in_array('App\\Traits\\HasSmartScopes', $traits);
+
+        return in_array('App\Traits\HasSmartScopes', $traits, true) ||
+               in_array('App\\Traits\\HasSmartScopes', $traits, true);
     }
 
     /**
-     * Extrae y separa los datos de relaciones many-to-many
+     * Determina si se deben aplicar los smart scopes.
      */
-    protected function extractRelationData(array &$validated, string $modelClass): array
+    private function shouldApplySmartScopes(): bool
     {
-        $modelInstance = new $modelClass;
-        $relationData = [];
-        
-        // Detectar relaciones many-to-many del modelo
+        return $this->applySmartScopes && $this->modelHasSmartScopes();
+    }
+
+    /**
+     * Determina si se debe aplicar el scope included.
+     */
+    private function shouldApplyIncludedScope(): bool
+    {
+        return $this->shouldApplySmartScopes() && request()->has('included');
+    }
+
+    /**
+     * Aplica todos los smart scopes disponibles al query.
+     */
+    private function applySmartScopes($query)
+    {
+        $availableScopes = ['included', 'filter', 'sort', 'search', 'fields', 'dateFilter'];
+
+        foreach ($availableScopes as $scope) {
+            if ($this->scopeExists($scope)) {
+                $query->$scope();
+            }
+        }
+
+        return $query;
+    }
+
+    /**
+     * Verifica si un scope existe en el modelo.
+     */
+    private function scopeExists(string $scopeName): bool
+    {
+        $modelClass = $this->getModelClass();
+        $methodName = 'scope' . ucfirst($scopeName);
+
+        return method_exists($modelClass, $methodName);
+    }
+
+    /**
+     * Ejecuta el query con paginación inteligente si está disponible.
+     */
+    private function executeQueryWithPagination($query)
+    {
+        return $this->shouldApplySmartScopes() && $this->scopeExists('getOrPaginate')
+            ? $query->getOrPaginate()
+            : $query->get();
+    }
+
+    // ==================== MÉTODOS PRIVADOS: RELACIONES ====================
+
+    /**
+     * Extrae y separa los datos de relaciones many-to-many del array validado.
+     */
+    private function extractManyToManyRelations(array &$validated): array
+    {
+        $modelClass = $this->getModelClass();
+        $modelInstance = new $modelClass();
         $manyToManyRelations = $this->getManyToManyRelations($modelInstance);
-        
-        // Log para debug
-        Log::info('Relaciones N:M detectadas: ' . implode(', ', $manyToManyRelations));
-        Log::info('Datos validados antes de extraer relaciones: ' . json_encode(array_keys($validated)));
-        
+
+        $relationData = [];
+
         foreach ($manyToManyRelations as $relation) {
-            // Verificar si los datos contienen esta relación
             if (isset($validated[$relation])) {
                 $relationData[$relation] = $validated[$relation];
                 unset($validated[$relation]);
-                Log::info("Relación '{$relation}' extraída correctamente");
+
+                $this->logRelationExtraction($relation, true);
             }
         }
-        
-        Log::info('Datos validados después de extraer relaciones: ' . json_encode(array_keys($validated)));
-        
+
         return $relationData;
     }
 
     /**
-     * Sincroniza las relaciones many-to-many
+     * Sincroniza las relaciones many-to-many de un modelo.
      */
-    protected function syncRelations(Model $record, array $relationData): void
+    private function syncManyToManyRelations(Model $record, array $relationData): void
     {
         foreach ($relationData as $relation => $ids) {
-            // Verificar que el método de relación existe
             if (!method_exists($record, $relation)) {
-                Log::warning("El método de relación '{$relation}' no existe en el modelo " . get_class($record));
+                $this->logRelationWarning($relation, 'método no existe');
                 continue;
             }
 
-            // Normalizar los IDs
             $normalizedIds = $this->normalizeRelationIds($ids);
 
             if (empty($normalizedIds)) {
-                Log::warning("No se proporcionaron IDs válidos para la relación '{$relation}'");
+                $this->logRelationWarning($relation, 'IDs inválidos');
                 continue;
             }
 
-            // Sincronizar la relación
             try {
                 $record->$relation()->sync($normalizedIds);
-                Log::info("Relación '{$relation}' sincronizada correctamente con IDs: " . implode(',', $normalizedIds));
-            } catch (\Exception $e) {
-                Log::error("Error al sincronizar la relación '{$relation}': " . $e->getMessage());
+                $this->logRelationSync($relation, $normalizedIds);
+            } catch (Exception $e) {
+                $this->logRelationError($relation, $e);
                 throw $e;
             }
         }
     }
 
     /**
-     * Normaliza los IDs de relación a un array
+     * Desvincula todas las relaciones many-to-many de un modelo.
      */
-    protected function normalizeRelationIds(mixed $ids): array
+    private function detachAllManyToManyRelations(Model $record): void
     {
-        // Si ya es un array, retornarlo filtrado
+        $manyToManyRelations = $this->getManyToManyRelations($record);
+
+        foreach ($manyToManyRelations as $relation) {
+            try {
+                if (method_exists($record, $relation)) {
+                    $record->$relation()->detach();
+                }
+            } catch (Exception $e) {
+                Log::warning("No se pudo hacer detach de la relación {$relation}: {$e->getMessage()}");
+            }
+        }
+    }
+
+    /**
+     * Recarga un registro con sus relaciones.
+     */
+    private function reloadRecordWithRelations(Model $record, array $relationData): Model
+    {
+        if ($this->shouldApplyIncludedScope()) {
+            return $this->createModelQuery()
+                ->included()
+                ->find($record->getKey());
+        }
+
+        $manyToManyRelations = array_keys($relationData);
+
+        return !empty($manyToManyRelations)
+            ? $record->load($manyToManyRelations)
+            : $record->fresh();
+    }
+
+    /**
+     * Normaliza los IDs de relación a un array de enteros.
+     */
+    private function normalizeRelationIds(mixed $ids): array
+    {
         if (is_array($ids)) {
             return array_filter($ids, fn($id) => is_numeric($id));
         }
 
-        // Si es un string con comas, convertir a array
         if (is_string($ids) && str_contains($ids, ',')) {
             return array_map('intval', array_filter(explode(',', $ids), 'is_numeric'));
         }
 
-        // Si es un número o string numérico, convertir a array
         if (is_numeric($ids)) {
-            return [(int)$ids];
+            return [(int) $ids];
         }
 
         return [];
     }
 
     /**
-     * Obtiene las relaciones many-to-many definidas en el modelo
-     * Método mejorado que inspecciona el código del método sin invocarlo
+     * Obtiene las relaciones many-to-many definidas en el modelo con cache.
      */
-    protected function getManyToManyRelations(Model $model): array
+    private function getManyToManyRelations(Model $model): array
+    {
+        $cacheKey = $this->getRelationsCacheKey($model);
+
+        return Cache::remember($cacheKey, self::CACHE_DURATION_RELATIONS, function () use ($model) {
+            return $this->detectManyToManyRelations($model);
+        });
+    }
+
+    /**
+     * Detecta relaciones many-to-many inspeccionando el código del modelo.
+     */
+    private function detectManyToManyRelations(Model $model): array
     {
         $relations = [];
         $methods = get_class_methods($model);
-        
+
         foreach ($methods as $method) {
-            // Ignorar métodos mágicos, getters, y métodos de Eloquent/Laravel
-            if (str_starts_with($method, '__') || 
-                str_starts_with($method, 'get') ||
-                str_starts_with($method, 'set') ||
-                str_starts_with($method, 'scope') ||
-                in_array($method, ['notifications', 'toArray', 'toJson', 'save', 'delete', 'update'])) {
+            if ($this->shouldSkipMethod($method)) {
                 continue;
             }
 
-            try {
-                $reflection = new \ReflectionMethod($model, $method);
-                
-                // Verificar que es un método público y no requiere parámetros
-                if (!$reflection->isPublic() || 
-                    $reflection->getNumberOfRequiredParameters() > 0 ||
-                    $reflection->isStatic()) {
-                    continue;
-                }
-
-                // Obtener el código fuente del método
-                $filename = $reflection->getFileName();
-                $start_line = $reflection->getStartLine();
-                $end_line = $reflection->getEndLine();
-                
-                if ($filename && $start_line && $end_line) {
-                    $length = $end_line - $start_line;
-                    $source = file($filename);
-                    $body = implode("", array_slice($source, $start_line, $length));
-                    
-                    // Buscar si contiene 'belongsToMany'
-                    if (stripos($body, 'belongsToMany') !== false) {
-                        $relations[] = $method;
-                        Log::info("Relación N:M detectada: {$method}");
-                    }
-                }
-            } catch (\Throwable $e) {
-                // Log del error para debug
-                Log::warning("Error al inspeccionar método {$method}: " . $e->getMessage());
-                continue;
+            if ($this->isManyToManyRelation($model, $method)) {
+                $relations[] = $method;
+                Log::info("Relación N:M detectada: {$method}");
             }
         }
-        
+
         return $relations;
     }
 
     /**
-     * Valida la petición usando FormRequest personalizado o reglas dinámicas
+     * Determina si un método debe ser ignorado en la detección de relaciones.
      */
-    protected function validateRequest(Request $request, string $action = 'store'): array
+    private function shouldSkipMethod(string $method): bool
     {
-        // Si hay FormRequest configurado, usarlo
-        $requestClass = $action === 'update' 
-            ? ($this->updateRequest ?? $this->storeRequest)
-            : $this->storeRequest;
+        return str_starts_with($method, '__') ||
+               str_starts_with($method, 'get') ||
+               str_starts_with($method, 'set') ||
+               str_starts_with($method, 'scope') ||
+               in_array($method, self::EXCLUDED_RELATION_METHODS, true);
+    }
 
-        if ($requestClass && class_exists($requestClass)) {
+    /**
+     * Verifica si un método es una relación many-to-many mediante reflexión.
+     */
+    private function isManyToManyRelation(Model $model, string $method): bool
+    {
+        try {
+            $reflection = new ReflectionMethod($model, $method);
+
+            if (!$this->isValidRelationMethod($reflection)) {
+                return false;
+            }
+
+            return $this->methodContainsBelongsToMany($reflection);
+
+        } catch (Throwable $e) {
+            Log::warning("Error al inspeccionar método {$method}: {$e->getMessage()}");
+            return false;
+        }
+    }
+
+    /**
+     * Valida que un método sea elegible para ser una relación.
+     */
+    private function isValidRelationMethod(ReflectionMethod $reflection): bool
+    {
+        return $reflection->isPublic() &&
+               $reflection->getNumberOfRequiredParameters() === 0 &&
+               !$reflection->isStatic();
+    }
+
+    /**
+     * Verifica si el código fuente de un método contiene 'belongsToMany'.
+     */
+    private function methodContainsBelongsToMany(ReflectionMethod $reflection): bool
+    {
+        $filename = $reflection->getFileName();
+        $startLine = $reflection->getStartLine();
+        $endLine = $reflection->getEndLine();
+
+        if (!$filename || !$startLine || !$endLine) {
+            return false;
+        }
+
+        $sourceLines = file($filename);
+        $methodBody = implode('', array_slice($sourceLines, $startLine, $endLine - $startLine));
+
+        return stripos($methodBody, 'belongsToMany') !== false;
+    }
+
+    /**
+     * Genera la clave de cache para las relaciones de un modelo.
+     */
+    private function getRelationsCacheKey(Model $model): string
+    {
+        return 'many_to_many_relations_' . get_class($model);
+    }
+
+    // ==================== MÉTODOS PRIVADOS: VALIDACIÓN ====================
+
+    /**
+     * Valida la petición usando FormRequest personalizado o reglas dinámicas.
+     */
+    private function validateRequest(Request $request, string $action): array
+    {
+        $requestClass = $this->getValidationRequestClass($action);
+
+        if ($requestClass !== null && class_exists($requestClass)) {
             return app($requestClass)->validated();
         }
 
-        // Generar reglas dinámicamente
-        $rules = $this->generateValidationRules($action);
+        return $this->validateWithDynamicRules($request, $action);
+    }
 
-        // Validar con las reglas generadas
+    /**
+     * Obtiene la clase FormRequest según la acción.
+     */
+    private function getValidationRequestClass(string $action): ?string
+    {
+        return $action === 'update'
+            ? ($this->updateRequest ?? $this->storeRequest)
+            : $this->storeRequest;
+    }
+
+    /**
+     * Valida usando reglas generadas dinámicamente.
+     *
+     * @throws ValidationException
+     */
+    private function validateWithDynamicRules(Request $request, string $action): array
+    {
+        $rules = $this->generateValidationRules($action);
         $validator = Validator::make($request->all(), $rules);
 
         if ($validator->fails()) {
-            throw new \Illuminate\Validation\ValidationException($validator);
+            throw new ValidationException($validator);
         }
 
         return $validator->validated();
     }
 
     /**
-     * Genera reglas de validación automáticamente desde el modelo
+     * Genera reglas de validación automáticamente desde el modelo.
      */
-    protected function generateValidationRules(string $action = 'store'): array
+    private function generateValidationRules(string $action): array
     {
-        $rules = [];
         $modelClass = $this->getModelClass();
-        $modelInstance = new $modelClass;
-        $table = $modelInstance->getTable();
+        $modelInstance = new $modelClass();
 
-        // Obtener campos fillable o columnas de la tabla
-        $fields = !empty($modelInstance->getFillable()) 
-            ? $modelInstance->getFillable()
-            : Schema::getColumnListing($table);
-
-        // Filtrar campos del sistema
-        $excludeFields = ['id', 'created_at', 'updated_at', 'deleted_at'];
-        $fields = array_diff($fields, $excludeFields);
-
-        foreach ($fields as $field) {
-            if (!Schema::hasColumn($table, $field)) {
-                continue;
-            }
-            
-            $columnType = Schema::getColumnType($table, $field);
-            $rule = $this->getRuleForField($field, $columnType, $table, $action);
-            
-            if ($rule) {
-                $rules[$field] = $rule;
-            }
-        }
+        $fields = $this->getValidatableFields($modelInstance);
+        $rules = $this->buildFieldRules($fields, $modelInstance, $action);
 
         // Agregar reglas para relaciones many-to-many
         $manyToManyRelations = $this->getManyToManyRelations($modelInstance);
         foreach ($manyToManyRelations as $relation) {
-            // Las relaciones N:M son opcionales
-            $rules[$relation] = 'sometimes|nullable';
+            $rules[$relation] = 'sometimes|nullable|array';
         }
 
         return $rules;
     }
 
     /**
-     * Genera la regla de validación para un campo específico
+     * Obtiene los campos validables del modelo.
      */
-    protected function getRuleForField(string $field, string $type, string $table, string $action): string
+    private function getValidatableFields(Model $model): array
     {
-        $baseRule = $action === 'update' ? 'sometimes' : 'required';
-        
-        // Campos de relación (foreign keys)
-        if (str_ends_with($field, '_id')) {
-            $relatedTable = str_replace('_id', 's', $field);
-            if (Schema::hasTable($relatedTable)) {
-                return "{$baseRule}|integer|exists:{$relatedTable},id";
+        $table = $model->getTable();
+        $fillable = $model->getFillable();
+
+        $fields = !empty($fillable)
+            ? $fillable
+            : Schema::getColumnListing($table);
+
+        return array_diff($fields, self::EXCLUDED_SYSTEM_FIELDS);
+    }
+
+    /**
+     * Construye las reglas de validación para los campos.
+     */
+    private function buildFieldRules(array $fields, Model $model, string $action): array
+    {
+        $rules = [];
+        $table = $model->getTable();
+
+        foreach ($fields as $field) {
+            if (!Schema::hasColumn($table, $field)) {
+                continue;
             }
-            return "{$baseRule}|integer";
+
+            $columnType = Schema::getColumnType($table, $field);
+            $rule = $this->generateFieldRule($field, $columnType, $table, $action);
+
+            if ($rule !== null) {
+                $rules[$field] = $rule;
+            }
+        }
+
+        return $rules;
+    }
+
+    /**
+     * Genera la regla de validación para un campo específico.
+     */
+    private function generateFieldRule(
+        string $field,
+        string $type,
+        string $table,
+        string $action
+    ): ?string {
+        $baseRule = $action === 'update' ? 'sometimes' : 'required';
+
+        // Campos de relación (foreign keys)
+        if ($this->isForeignKeyField($field)) {
+            return $this->buildForeignKeyRule($field, $baseRule);
         }
 
         // Campos booleanos
-        if (str_starts_with($field, 'is_') || $type === 'boolean') {
+        if ($this->isBooleanField($field, $type)) {
             return "{$baseRule}|boolean";
         }
 
         // Campos de email
-        if (str_contains($field, 'email')) {
+        if ($this->isEmailField($field)) {
             return "{$baseRule}|email|max:255";
         }
 
-        // Según el tipo de columna
+        // Reglas según tipo de columna
+        return $this->getRuleByColumnType($type, $baseRule);
+    }
+
+    /**
+     * Determina si un campo es una foreign key.
+     */
+    private function isForeignKeyField(string $field): bool
+    {
+        return str_ends_with($field, '_id');
+    }
+
+    /**
+     * Construye la regla para un campo foreign key.
+     */
+    private function buildForeignKeyRule(string $field, string $baseRule): string
+    {
+        $relatedTable = str_replace('_id', 's', $field);
+
+        if (Schema::hasTable($relatedTable)) {
+            return "{$baseRule}|integer|exists:{$relatedTable},id";
+        }
+
+        return "{$baseRule}|integer";
+    }
+
+    /**
+     * Determina si un campo es booleano.
+     */
+    private function isBooleanField(string $field, string $type): bool
+    {
+        return str_starts_with($field, 'is_') || $type === 'boolean';
+    }
+
+    /**
+     * Determina si un campo es de email.
+     */
+    private function isEmailField(string $field): bool
+    {
+        return str_contains($field, 'email');
+    }
+
+    /**
+     * Obtiene la regla de validación según el tipo de columna.
+     */
+    private function getRuleByColumnType(string $type, string $baseRule): string
+    {
         return match ($type) {
             'integer', 'bigint', 'smallint' => "{$baseRule}|integer",
             'decimal', 'float', 'double' => "{$baseRule}|numeric",
@@ -653,57 +828,308 @@ trait CrudTrait
         };
     }
 
+    // ==================== MÉTODOS PRIVADOS: SERVICIOS ====================
+
     /**
-     * Maneja errores de forma consistente
+     * Verifica si el servicio tiene un método específico.
      */
-    protected function handleError(Exception $e): JsonResponse
+    private function hasServiceMethod(string $method): bool
     {
-        Log::error('CrudTrait Error: ' . $e->getMessage(), [
-            'trace' => $e->getTraceAsString(),
-            'file' => $e->getFile(),
-            'line' => $e->getLine()
-        ]);
+        return $this->service !== null && method_exists($this->service, $method);
+    }
+
+    // ==================== MÉTODOS PRIVADOS: RESPUESTAS ====================
+
+    /**
+     * Genera una respuesta JSON exitosa.
+     */
+    private function successResponse(
+        mixed $data,
+        string $message,
+        int $status = 200
+    ): JsonResponse {
+        return response()->json([
+            'success' => true,
+            'message' => $message,
+            'data' => $data,
+        ], $status);
+    }
+
+    /**
+     * Genera una respuesta JSON de error 404.
+     */
+    private function notFoundResponse(): JsonResponse
+    {
+        return response()->json([
+            'success' => false,
+            'message' => "{$this->getResourceName()} no encontrado",
+        ], 404);
+    }
+
+    /**
+     * Genera una respuesta JSON de error de validación.
+     */
+    private function validationErrorResponse(ValidationException $e): JsonResponse
+    {
+        return response()->json([
+            'success' => false,
+            'message' => 'Error de validación',
+            'errors' => $e->errors(),
+        ], 422);
+    }
+
+    /**
+     * Genera una respuesta JSON de error genérico.
+     */
+    private function errorResponse(Exception $e): JsonResponse
+    {
+        $this->logError($e);
+
+        $statusCode = $this->getExceptionStatusCode($e);
 
         return response()->json([
-            'error' => true,
-            'message' => config('app.debug') ? $e->getMessage() : 'Ha ocurrido un error en el servidor',
-            'trace' => config('app.debug') ? $e->getTraceAsString() : null
-        ], 500);
+            'success' => false,
+            'message' => $this->getExceptionMessage($e),
+            'trace' => $this->shouldShowTrace() ? $e->getTraceAsString() : null,
+        ], $statusCode);
+    }
+
+    /**
+     * Obtiene el código de estado HTTP desde una excepción.
+     */
+    private function getExceptionStatusCode(Exception $e): int
+    {
+        return (int) ($e->getCode() >= 400 && $e->getCode() < 600 ? $e->getCode() : 500);
+    }
+
+    /**
+     * Obtiene el mensaje apropiado de una excepción.
+     */
+    private function getExceptionMessage(Exception $e): string
+    {
+        return config('app.debug')
+            ? $e->getMessage()
+            : 'Ha ocurrido un error en el servidor';
+    }
+
+    /**
+     * Determina si se debe mostrar el trace de la excepción.
+     */
+    private function shouldShowTrace(): bool
+    {
+        return (bool) config('app.debug');
+    }
+
+    // ==================== MÉTODOS PRIVADOS: LOGGING ====================
+
+    /**
+     * Registra un error en los logs.
+     */
+    private function logError(Exception $e): void
+    {
+        Log::error('CrudTrait Error: ' . $e->getMessage(), [
+            'exception' => get_class($e),
+            'trace' => $e->getTraceAsString(),
+            'file' => $e->getFile(),
+            'line' => $e->getLine(),
+        ]);
+    }
+
+    /**
+     * Registra la extracción de una relación.
+     */
+    private function logRelationExtraction(string $relation, bool $success): void
+    {
+        if ($success) {
+            Log::info("Relación '{$relation}' extraída correctamente");
+        }
+    }
+
+    /**
+     * Registra la sincronización de una relación.
+     */
+    private function logRelationSync(string $relation, array $ids): void
+    {
+        Log::info("Relación '{$relation}' sincronizada con IDs: " . implode(',', $ids));
+    }
+
+    /**
+     * Registra una advertencia sobre una relación.
+     */
+    private function logRelationWarning(string $relation, string $reason): void
+    {
+        Log::warning("Problema con la relación '{$relation}': {$reason}");
+    }
+
+    /**
+     * Registra un error en una relación.
+     */
+    private function logRelationError(string $relation, Exception $e): void
+    {
+        Log::error("Error al sincronizar la relación '{$relation}': {$e->getMessage()}");
+    }
+
+    // ==================== MÉTODOS PÚBLICOS: UTILIDADES ====================
+
+    /**
+     * Limpia el cache de relaciones del modelo.
+     */
+    public function clearRelationsCache(): void
+    {
+        $modelClass = $this->getModelClass();
+        $modelInstance = new $modelClass();
+        $cacheKey = $this->getRelationsCacheKey($modelInstance);
+
+        Cache::forget($cacheKey);
     }
 }
 
 /**
  * =============================================================================
- * INSTRUCCIONES DE USO
+ * GUÍA DE USO - CrudTrait Refactorizado
  * =============================================================================
- * 
- * En tu controlador, simplemente usa el trait SIN constructor:
- * 
- * use App\Traits\CrudTrait;
- * 
+ *
+ * USO BÁSICO (Detección automática):
+ *
  * class PublicationController extends Controller
  * {
  *     use CrudTrait;
- *     
- *     // ¡NO necesitas agregar nada más!
- *     // El trait detecta automáticamente el modelo "Publication"
+ *
+ *     // ¡Listo! El trait detecta automáticamente el modelo "Publication"
  * }
- * 
- * Si quieres personalizar, puedes agregar un constructor:
- * 
+ *
+ * -----------------------------------------------------------------------------
+ *
+ * USO CON CONFIGURACIÓN PERSONALIZADA:
+ *
  * class PublicationController extends Controller
  * {
  *     use CrudTrait;
- *     
+ *
  *     public function __construct()
  *     {
- *         // Opcional: configurar manualmente
  *         $this->configureCrud(
+ *             service: app(PublicationService::class),
+ *             storeRequest: StorePublicationRequest::class,
+ *             updateRequest: UpdatePublicationRequest::class,
  *             resourceName: 'Publication',
  *             applySmartScopes: true
  *         );
  *     }
  * }
- * 
+ *
+ * -----------------------------------------------------------------------------
+ *
+ * INTEGRACIÓN CON HasSmartScopes:
+ *
+ * El trait detecta automáticamente si tu modelo usa HasSmartScopes.
+ * Si lo detecta, aplicará automáticamente estos scopes en el método index():
+ *
+ * - included()   -> Carga de relaciones
+ * - filter()     -> Filtrado avanzado
+ * - sort()       -> Ordenamiento
+ * - search()     -> Búsqueda global
+ * - fields()     -> Selección de campos
+ * - dateFilter() -> Filtros de fecha
+ *
+ * Si NO detecta HasSmartScopes, simplemente devolverá todos los registros
+ * sin aplicar scopes (comportamiento seguro por defecto).
+ *
+ * -----------------------------------------------------------------------------
+ *
+ * ENDPOINTS GENERADOS AUTOMÁTICAMENTE:
+ *
+ * GET    /api/resources           -> index()   (Lista todos)
+ * GET    /api/resources/{id}      -> show()    (Muestra uno)
+ * POST   /api/resources           -> store()   (Crea nuevo)
+ * PUT    /api/resources/{id}      -> update()  (Actualiza)
+ * DELETE /api/resources/{id}      -> destroy() (Elimina)
+ *
+ * -----------------------------------------------------------------------------
+ *
+ * EJEMPLOS DE PETICIONES CON SMART SCOPES:
+ *
+ * # Filtrado simple
+ * GET /api/publications?filter[title]=Laravel
+ *
+ * # Filtrado avanzado
+ * GET /api/publications?filter[status][in]=published,draft&filter[views][gte]=100
+ *
+ * # Ordenamiento
+ * GET /api/publications?sort=-created_at,title
+ *
+ * # Búsqueda global
+ * GET /api/publications?search=tutorial
+ *
+ * # Relaciones incluidas
+ * GET /api/publications?included=author,comments.user,tags
+ *
+ * # Paginación
+ * GET /api/publications?perPage=20&page=2
+ *
+ * # Combinación de parámetros
+ * GET /api/publications?included=author&filter[status]=published&sort=-views&perPage=15
+ *
+ * -----------------------------------------------------------------------------
+ *
+ * SOPORTE PARA RELACIONES MANY-TO-MANY:
+ *
+ * El trait detecta automáticamente relaciones belongsToMany y las maneja:
+ *
+ * POST /api/publications
+ * {
+ *     "title": "Mi publicación",
+ *     "content": "Contenido...",
+ *     "tags": [1, 2, 3],      // ← Sincroniza automáticamente
+ *     "categories": [5, 8]     // ← Sincroniza automáticamente
+ * }
+ *
+ * PUT /api/publications/1
+ * {
+ *     "title": "Título actualizado",
+ *     "tags": [2, 4, 6]        // ← Sincroniza automáticamente
+ * }
+ *
+ * DELETE /api/publications/1  // ← Hace detach automático antes de eliminar
+ *
+ * -----------------------------------------------------------------------------
+ *
+ * VALIDACIÓN AUTOMÁTICA:
+ *
+ * Si no defines FormRequests, el trait genera reglas automáticamente:
+ *
+ * - Detecta tipos de columnas (integer, string, date, etc.)
+ * - Valida foreign keys con exists
+ * - Detecta campos booleanos (is_active, etc.)
+ * - Valida emails automáticamente
+ * - Maneja relaciones N:M como arrays opcionales
+ *
+ * -----------------------------------------------------------------------------
+ *
+ * RESPUESTAS JSON CONSISTENTES:
+ *
+ * Éxito:
+ * {
+ *     "success": true,
+ *     "message": "Publication creado correctamente",
+ *     "data": { ... }
+ * }
+ *
+ * Error de validación:
+ * {
+ *     "success": false,
+ *     "message": "Error de validación",
+ *     "errors": {
+ *         "title": ["El campo título es obligatorio"]
+ *     }
+ * }
+ *
+ * Error genérico:
+ * {
+ *     "success": false,
+ *     "message": "Ha ocurrido un error en el servidor",
+ *     "trace": "..." // Solo en modo debug
+ * }
+ *
  * =============================================================================
  */
