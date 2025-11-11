@@ -34,8 +34,7 @@ class MakeSmartSeed extends Command
     protected $faker;
     protected $generatedIds = [];
     protected $processedModels = [];
-    protected $modelsGraph = [];
-    protected $uniqueValues = []; // Para rastrear valores únicos generados
+    protected $uniqueValues = [];
 
     /**
      * Execute the console command.
@@ -87,14 +86,6 @@ class MakeSmartSeed extends Command
             $this->truncateModel($modelClass);
         }
 
-        $dependencies = $this->getModelDependencies($modelClass);
-        
-        foreach ($dependencies as $depClass) {
-            if (!isset($this->processedModels[$depClass])) {
-                $this->generateForModel(class_basename($depClass), $count);
-            }
-        }
-
         $this->insertRecords($modelClass, $count);
         $this->generatePivotsForModel($modelClass);
     }
@@ -111,7 +102,7 @@ class MakeSmartSeed extends Command
             return;
         }
 
-        $sortedModels = $this->sortModelsByDependencies($models);
+        $sortedModels = $this->sortModelsByMigrations($models);
 
         if ($this->option('refresh')) {
             $this->info("🗑️  Limpiando tablas...");
@@ -164,78 +155,96 @@ class MakeSmartSeed extends Command
     }
 
     /**
-     * Ordena modelos por dependencias
+     * Ordena modelos por el orden cronológico de las migraciones
      */
-    protected function sortModelsByDependencies(array $models): array
+    protected function sortModelsByMigrations(array $models): array
     {
-        $graph = [];
-        $sorted = [];
-        $visited = [];
-
-        foreach ($models as $model) {
-            $graph[$model] = $this->getModelDependencies($model);
+        $migrationsPath = database_path('migrations');
+        
+        if (!File::isDirectory($migrationsPath)) {
+            $this->warn("⚠️  Carpeta de migraciones no encontrada");
+            return $models;
         }
 
-        $visit = function ($model) use (&$visit, &$visited, &$sorted, $graph) {
-            if (isset($visited[$model])) {
-                return;
+        // Obtener archivos de migración ordenados alfabéticamente (timestamp)
+        $migrationFiles = File::files($migrationsPath);
+        
+        // Ordenar por nombre de archivo (el timestamp ya los ordena cronológicamente)
+        usort($migrationFiles, fn($a, $b) => strcmp($a->getFilename(), $b->getFilename()));
+
+        // Extraer nombres de tablas de las migraciones en orden
+        $tablesOrder = [];
+        foreach ($migrationFiles as $file) {
+            $tableName = $this->extractTableNameFromMigration($file);
+            if ($tableName) {
+                $tablesOrder[] = $tableName;
             }
+        }
 
-            $visited[$model] = true;
-
-            if (isset($graph[$model])) {
-                foreach ($graph[$model] as $dependency) {
-                    if (in_array($dependency, array_keys($graph))) {
-                        $visit($dependency);
-                    }
+        // Crear mapa de tabla => modelo
+        $tableToModel = [];
+        foreach ($models as $modelClass) {
+            try {
+                $model = new $modelClass;
+                $table = $model->getTable();
+                
+                if (Schema::hasTable($table)) {
+                    $tableToModel[$table] = $modelClass;
                 }
+            } catch (\Exception $e) {
+                // Modelo sin tabla válida, se omite
             }
-
-            $sorted[] = $model;
-        };
-
-        foreach ($models as $model) {
-            $visit($model);
         }
 
-        return $sorted;
+        // Ordenar modelos según el orden de las migraciones
+        $sortedModels = [];
+        foreach ($tablesOrder as $table) {
+            if (isset($tableToModel[$table])) {
+                $sortedModels[] = $tableToModel[$table];
+                unset($tableToModel[$table]); // Evitar duplicados
+            }
+        }
+
+        // Agregar modelos que no se encontraron en migraciones al final
+        foreach ($tableToModel as $modelClass) {
+            $sortedModels[] = $modelClass;
+        }
+
+        return $sortedModels;
     }
 
     /**
-     * Obtiene dependencias de un modelo
+     * Extrae el nombre de la tabla desde un archivo de migración
      */
-    protected function getModelDependencies(string $modelClass): array
+    protected function extractTableNameFromMigration($file): ?string
     {
-        $dependencies = [];
-        $model = new $modelClass;
-        $table = $model->getTable();
+        $content = File::get($file->getPathname());
+        
+        // Patrones comunes en migraciones de Laravel
+        $patterns = [
+            "/Schema::create\s*\(\s*['\"]([^'\"]+)['\"]/",
+            "/Schema::table\s*\(\s*['\"]([^'\"]+)['\"]/",
+            "/Schema::rename\s*\(\s*['\"]([^'\"]+)['\"].*['\"]([^'\"]+)['\"]/",
+        ];
 
-        if (!Schema::hasTable($table)) {
-            return $dependencies;
-        }
-
-        $columns = Schema::getColumnListing($table);
-
-        foreach ($columns as $column) {
-            if (Str::endsWith($column, '_id') && !in_array($column, ['created_by', 'updated_by', 'deleted_by'])) {
-                $relationName = Str::camel(Str::beforeLast($column, '_id'));
-                
-                if (method_exists($model, $relationName)) {
-                    try {
-                        $relation = $model->$relationName();
-                        $relatedClass = get_class($relation->getRelated());
-                        
-                        if ($relatedClass !== $modelClass) {
-                            $dependencies[] = $relatedClass;
-                        }
-                    } catch (\Exception $e) {
-                        // Relación no válida
-                    }
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $content, $matches)) {
+                // Para Schema::create o Schema::table, retornar el primer grupo
+                if (isset($matches[1])) {
+                    // Si es un rename, preferir el segundo nombre (tabla nueva)
+                    return $matches[count($matches) - 1];
                 }
             }
         }
 
-        return array_unique($dependencies);
+        // Intentar extraer del nombre del archivo como fallback
+        // Ejemplo: 2024_01_01_000000_create_users_table.php -> users
+        $fileName = $file->getFilename();
+        if (preg_match('/_create_(.+)_table\.php$/', $fileName, $matches)) {
+            return $matches[1];
+        }
+
+        return null;
     }
 
     /**
