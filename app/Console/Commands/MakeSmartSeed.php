@@ -2,43 +2,130 @@
 
 namespace App\Console\Commands;
 
+use Faker\Factory as Faker;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
-use Faker\Factory as Faker;
 use ReflectionClass;
 use ReflectionMethod;
 
 class MakeSmartSeed extends Command
 {
-    /**
-     * The name and signature of the console command.
-     *
-     * @var string
-     */
     protected $signature = 'make:smart-seed 
                             {model? : El modelo específico a generar (opcional)}
                             {--count=10 : Cantidad de registros a generar}
                             {--refresh : Truncar tablas antes de insertar}
                             {--only-pivots : Solo generar relaciones en tablas pivote}';
 
-    /**
-     * The console command description.
-     *
-     * @var string
-     */
     protected $description = 'Genera datos de prueba inteligentes con relaciones coherentes';
 
     protected $faker;
+
     protected $generatedIds = [];
+
     protected $processedModels = [];
+
     protected $uniqueValues = [];
 
-    /**
-     * Execute the console command.
-     */
+    protected $modelClass = [];
+
+    // Configuración de patrones para detección inteligente
+    protected array $columnPatterns = [
+        // Patrones exactos (prioridad alta)
+        'exact' => [
+            'email_verified_at' => ['type' => 'datetime', 'range' => ['-1 year', 'now']],
+            'published_at' => ['type' => 'datetime', 'range' => ['-1 year', 'now']],
+            'verified_at' => ['type' => 'datetime', 'range' => ['-1 year', 'now']],
+            'birth_date' => ['type' => 'date', 'max' => '-18 years'],
+            'birthdate' => ['type' => 'date', 'max' => '-18 years'],
+            'password' => ['type' => 'bcrypt', 'value' => 'password'],
+            'remember_token' => ['type' => 'string', 'length' => 60],
+            'api_token' => ['type' => 'string', 'length' => 80],
+            'verification_code' => ['type' => 'numeric', 'pattern' => '######'],
+            'invoice_number' => ['type' => 'reference', 'prefix' => 'INV'],
+            'order_number' => ['type' => 'reference', 'prefix' => 'ORD'],
+        ],
+
+        // Patrones de sufijos (prioridad media-alta)
+        'suffix' => [
+            '_at' => ['type' => 'datetime'],
+            '_date' => ['type' => 'date'],
+            '_time' => ['type' => 'time'],
+            '_id' => ['type' => 'foreign_key'],
+        ],
+
+        // Patrones de prefijos (prioridad media)
+        'prefix' => [
+            'is_' => ['type' => 'boolean'],
+            'has_' => ['type' => 'boolean'],
+            'can_' => ['type' => 'boolean'],
+            'should_' => ['type' => 'boolean'],
+            'will_' => ['type' => 'boolean'],
+            'must_' => ['type' => 'boolean'],
+        ],
+
+        // Patrones por palabra clave (prioridad baja)
+        'contains' => [
+            'email' => ['type' => 'email', 'unique' => true],
+            'username' => ['type' => 'username', 'unique' => true],
+            'slug' => ['type' => 'slug', 'unique' => true],
+            'phone' => ['type' => 'phone'],
+            'mobile' => ['type' => 'phone'],
+            'telephone' => ['type' => 'phone'],
+            'address' => ['type' => 'address'],
+            'street' => ['type' => 'street'],
+            'city' => ['type' => 'city'],
+            'state' => ['type' => 'state'],
+            'country' => ['type' => 'country'],
+            'postal' => ['type' => 'postcode'],
+            'zip' => ['type' => 'postcode'],
+            'name' => ['type' => 'name'],
+            'title' => ['type' => 'title'],
+            'description' => ['type' => 'paragraph'],
+            'content' => ['type' => 'text', 'paragraphs' => 3],
+            'body' => ['type' => 'text', 'paragraphs' => 5],
+            'bio' => ['type' => 'paragraph'],
+            'url' => ['type' => 'url'],
+            'website' => ['type' => 'url'],
+            'link' => ['type' => 'url'],
+            'image' => ['type' => 'image'],
+            'avatar' => ['type' => 'image', 'category' => 'people'],
+            'photo' => ['type' => 'image', 'width' => 800, 'height' => 600],
+            'thumbnail' => ['type' => 'image', 'width' => 150, 'height' => 150],
+            'logo' => ['type' => 'image', 'width' => 300, 'height' => 100],
+            'age' => ['type' => 'integer', 'min' => 18, 'max' => 80],
+            'year' => ['type' => 'year'],
+            'price' => ['type' => 'float', 'min' => 10, 'max' => 1000],
+            'cost' => ['type' => 'float', 'min' => 5, 'max' => 500],
+            'amount' => ['type' => 'float', 'min' => 0, 'max' => 10000],
+            'salary' => ['type' => 'float', 'min' => 20000, 'max' => 100000],
+            'quantity' => ['type' => 'integer', 'min' => 1, 'max' => 100],
+            'stock' => ['type' => 'integer', 'min' => 0, 'max' => 500],
+            'views' => ['type' => 'integer', 'min' => 0, 'max' => 100000],
+            'rating' => ['type' => 'float', 'min' => 0, 'max' => 5, 'decimals' => 1],
+            'score' => ['type' => 'integer', 'min' => 0, 'max' => 100],
+            'status' => ['type' => 'enum', 'values' => ['active', 'inactive', 'pending', 'completed']],
+            'role' => ['type' => 'enum', 'values' => ['admin', 'user', 'guest']],
+            'priority' => ['type' => 'enum', 'values' => ['low', 'medium', 'high']],
+            'gender' => ['type' => 'enum', 'values' => ['male', 'female', 'other']],
+            'token' => ['type' => 'string', 'length' => 60],
+            'code' => ['type' => 'alphanumeric', 'pattern' => '???-###'],
+            'uuid' => ['type' => 'uuid'],
+            'color' => ['type' => 'color'],
+            'ip' => ['type' => 'ip'],
+            'latitude' => ['type' => 'latitude'],
+            'longitude' => ['type' => 'longitude'],
+            'company' => ['type' => 'company'],
+            'position' => ['type' => 'job_title'],
+            'locale' => ['type' => 'locale'],
+            'language' => ['type' => 'language_code'],
+            'timezone' => ['type' => 'timezone'],
+            'currency' => ['type' => 'currency'],
+        ],
+    ];
+
     public function handle()
     {
         $this->faker = Faker::create('es_ES');
@@ -51,6 +138,7 @@ class MakeSmartSeed extends Command
         try {
             if ($onlyPivots) {
                 $this->generateOnlyPivots();
+
                 return 0;
             }
 
@@ -61,24 +149,24 @@ class MakeSmartSeed extends Command
             }
 
             $this->info("\n✨ Proceso completado exitosamente!");
+
             return 0;
 
         } catch (\Exception $e) {
-            $this->error("\n❌ Error: " . $e->getMessage());
+            $this->error("\n❌ Error: ".$e->getMessage());
             $this->error($e->getTraceAsString());
+
             return 1;
         }
     }
 
-    /**
-     * Genera datos para un modelo específico
-     */
     protected function generateForModel(string $modelName, int $count)
     {
         $modelClass = $this->getModelClass($modelName);
-        
-        if (!$modelClass) {
+
+        if (! $modelClass) {
             $this->error("❌ Modelo {$modelName} no encontrado");
+
             return;
         }
 
@@ -90,22 +178,20 @@ class MakeSmartSeed extends Command
         $this->generatePivotsForModel($modelClass);
     }
 
-    /**
-     * Genera datos para todos los modelos
-     */
     protected function generateForAllModels(int $count)
     {
         $models = $this->getAllModels();
-        
+
         if (empty($models)) {
-            $this->warn("⚠️  No se encontraron modelos en app/Models");
+            $this->warn('⚠️  No se encontraron modelos en app/Models');
+
             return;
         }
 
         $sortedModels = $this->sortModelsByMigrations($models);
 
         if ($this->option('refresh')) {
-            $this->info("🗑️  Limpiando tablas...");
+            $this->info('🗑️  Limpiando tablas...');
             foreach (array_reverse($sortedModels) as $modelClass) {
                 $this->truncateModel($modelClass);
             }
@@ -115,37 +201,33 @@ class MakeSmartSeed extends Command
             $this->insertRecords($modelClass, $count);
         }
 
-        // Generar pivotes después de todos los modelos
         $this->info("\n🔗 Generando relaciones en tablas pivote...");
         foreach ($sortedModels as $modelClass) {
             $this->generatePivotsForModel($modelClass);
         }
     }
 
-    /**
-     * Obtiene todos los modelos de app/Models
-     */
     protected function getAllModels(): array
     {
         $modelsPath = app_path('Models');
         $models = [];
 
-        if (!File::isDirectory($modelsPath)) {
+        if (! File::isDirectory($modelsPath)) {
             return $models;
         }
 
         $files = File::allFiles($modelsPath);
 
         foreach ($files as $file) {
-            $className = 'App\\Models\\' . str_replace(
+            $className = 'App\\Models\\'.str_replace(
                 ['/', '.php'],
                 ['\\', ''],
-                Str::after($file->getPathname(), app_path('Models') . DIRECTORY_SEPARATOR)
+                Str::after($file->getPathname(), app_path('Models').DIRECTORY_SEPARATOR)
             );
 
             if (class_exists($className)) {
                 $reflection = new ReflectionClass($className);
-                if (!$reflection->isAbstract() && $reflection->isSubclassOf('Illuminate\Database\Eloquent\Model')) {
+                if (! $reflection->isAbstract() && $reflection->isSubclassOf('Illuminate\Database\Eloquent\Model')) {
                     $models[] = $className;
                 }
             }
@@ -154,25 +236,19 @@ class MakeSmartSeed extends Command
         return $models;
     }
 
-    /**
-     * Ordena modelos por el orden cronológico de las migraciones
-     */
     protected function sortModelsByMigrations(array $models): array
     {
         $migrationsPath = database_path('migrations');
-        
-        if (!File::isDirectory($migrationsPath)) {
-            $this->warn("⚠️  Carpeta de migraciones no encontrada");
+
+        if (! File::isDirectory($migrationsPath)) {
+            $this->warn('⚠️  Carpeta de migraciones no encontrada');
+
             return $models;
         }
 
-        // Obtener archivos de migración ordenados alfabéticamente (timestamp)
         $migrationFiles = File::files($migrationsPath);
-        
-        // Ordenar por nombre de archivo (el timestamp ya los ordena cronológicamente)
-        usort($migrationFiles, fn($a, $b) => strcmp($a->getFilename(), $b->getFilename()));
+        usort($migrationFiles, fn ($a, $b) => strcmp($a->getFilename(), $b->getFilename()));
 
-        // Extraer nombres de tablas de las migraciones en orden
         $tablesOrder = [];
         foreach ($migrationFiles as $file) {
             $tableName = $this->extractTableNameFromMigration($file);
@@ -181,13 +257,12 @@ class MakeSmartSeed extends Command
             }
         }
 
-        // Crear mapa de tabla => modelo
         $tableToModel = [];
         foreach ($models as $modelClass) {
             try {
                 $model = new $modelClass;
                 $table = $model->getTable();
-                
+
                 if (Schema::hasTable($table)) {
                     $tableToModel[$table] = $modelClass;
                 }
@@ -196,16 +271,14 @@ class MakeSmartSeed extends Command
             }
         }
 
-        // Ordenar modelos según el orden de las migraciones
         $sortedModels = [];
         foreach ($tablesOrder as $table) {
             if (isset($tableToModel[$table])) {
                 $sortedModels[] = $tableToModel[$table];
-                unset($tableToModel[$table]); // Evitar duplicados
+                unset($tableToModel[$table]);
             }
         }
 
-        // Agregar modelos que no se encontraron en migraciones al final
         foreach ($tableToModel as $modelClass) {
             $sortedModels[] = $modelClass;
         }
@@ -213,14 +286,10 @@ class MakeSmartSeed extends Command
         return $sortedModels;
     }
 
-    /**
-     * Extrae el nombre de la tabla desde un archivo de migración
-     */
     protected function extractTableNameFromMigration($file): ?string
     {
         $content = File::get($file->getPathname());
-        
-        // Patrones comunes en migraciones de Laravel
+
         $patterns = [
             "/Schema::create\s*\(\s*['\"]([^'\"]+)['\"]/",
             "/Schema::table\s*\(\s*['\"]([^'\"]+)['\"]/",
@@ -229,16 +298,12 @@ class MakeSmartSeed extends Command
 
         foreach ($patterns as $pattern) {
             if (preg_match($pattern, $content, $matches)) {
-                // Para Schema::create o Schema::table, retornar el primer grupo
                 if (isset($matches[1])) {
-                    // Si es un rename, preferir el segundo nombre (tabla nueva)
                     return $matches[count($matches) - 1];
                 }
             }
         }
 
-        // Intentar extraer del nombre del archivo como fallback
-        // Ejemplo: 2024_01_01_000000_create_users_table.php -> users
         $fileName = $file->getFilename();
         if (preg_match('/_create_(.+)_table\.php$/', $fileName, $matches)) {
             return $matches[1];
@@ -247,17 +312,15 @@ class MakeSmartSeed extends Command
         return null;
     }
 
-    /**
-     * Inserta registros para un modelo
-     */
     protected function insertRecords(string $modelClass, int $count)
     {
         $model = new $modelClass;
         $table = $model->getTable();
         $modelName = class_basename($modelClass);
 
-        if (!Schema::hasTable($table)) {
+        if (! Schema::hasTable($table)) {
             $this->warn("⚠️  Tabla {$table} no existe para {$modelName}");
+
             return;
         }
 
@@ -271,13 +334,11 @@ class MakeSmartSeed extends Command
         $fillableColumns = $this->getFillableColumns($model, $columns);
 
         try {
-            // Insertar registro por registro para respetar restricciones UNIQUE
             $insertedIds = [];
-            
+
             for ($i = 0; $i < $count; $i++) {
                 $record = $this->generateRecord($modelClass, $fillableColumns);
-                
-                // Verificar si hay campos únicos con valores nulos
+
                 $hasNullRequired = false;
                 foreach ($record as $key => $value) {
                     if ($value === null && Str::endsWith($key, '_id')) {
@@ -285,15 +346,15 @@ class MakeSmartSeed extends Command
                         break;
                     }
                 }
-                
-                if (!$hasNullRequired) {
+
+                if (! $hasNullRequired) {
                     try {
                         $id = DB::table($table)->insertGetId($record);
                         $insertedIds[] = $id;
                     } catch (\Exception $e) {
-                        // Si falla, intentar con valores únicos regenerados
                         if (Str::contains($e->getMessage(), ['Duplicate entry', 'UNIQUE'])) {
-                            $this->warn("  ⚠️  Registro duplicado detectado, regenerando...");
+                            $this->warn('  ⚠️  Registro duplicado detectado, regenerando...');
+
                             continue;
                         } else {
                             throw $e;
@@ -303,46 +364,37 @@ class MakeSmartSeed extends Command
             }
 
             if (empty($insertedIds)) {
-                // Si no se insertó ninguno, obtener IDs existentes
                 $insertedIds = DB::table($table)->pluck('id')->toArray();
             }
 
-            // Guardar IDs generados
             $this->generatedIds[$modelClass] = $insertedIds;
             $this->processedModels[$modelClass] = true;
 
             $actualCount = count($insertedIds);
             $this->info("✅ Se generaron {$actualCount} registros para {$modelName}");
-            
+
         } catch (\Exception $e) {
-            $this->error("❌ Error al insertar {$modelName}: " . $e->getMessage());
+            $this->error("❌ Error al insertar {$modelName}: ".$e->getMessage());
         }
     }
 
-    /**
-     * Obtiene columnas que se pueden llenar
-     */
     protected function getFillableColumns($model, array $columns): array
     {
         $excluded = ['id', 'created_at', 'updated_at', 'deleted_at', 'remember_token'];
-        
+
         return array_filter($columns, function ($column) use ($excluded, $model) {
             if (in_array($column, $excluded)) {
                 return false;
             }
 
-            // Si el modelo tiene $guarded, respetarlo
-            if (property_exists($model, 'guarded') && !empty($model->guarded)) {
-                return !in_array($column, $model->guarded);
+            if (property_exists($model, 'guarded') && ! empty($model->guarded)) {
+                return ! in_array($column, $model->guarded);
             }
 
             return true;
         });
     }
 
-    /**
-     * Genera un registro con datos coherentes
-     */
     protected function generateRecord(string $modelClass, array $columns): array
     {
         $record = [];
@@ -350,67 +402,32 @@ class MakeSmartSeed extends Command
         $generatedForRelations = [];
         $table = $model->getTable();
 
-        // Inicializar rastreador de valores únicos para esta tabla si no existe
-        if (!isset($this->uniqueValues[$table])) {
+        if (! isset($this->uniqueValues[$table])) {
             $this->uniqueValues[$table] = [];
         }
 
-        // Primera pasada: generar valores no-relacionales
+        // Primero generar campos normales
         foreach ($columns as $column) {
-            if (!Str::endsWith($column, '_id')) {
+            if (! Str::endsWith($column, '_id')) {
                 $value = $this->generateValueForColumn($modelClass, $column, $model);
-                
-                // Para campos que pueden ser únicos, asegurar unicidad
-                if (in_array($column, ['email', 'username', 'slug'])) {
-                    $attempts = 0;
-                    while (isset($this->uniqueValues[$table][$column][$value]) && $attempts < 10) {
-                        $value = $this->generateValueForColumn($modelClass, $column, $model);
-                        $attempts++;
-                    }
-                    $this->uniqueValues[$table][$column][$value] = true;
+
+                // Manejar unicidad
+                if ($this->requiresUniqueness($column)) {
+                    $value = $this->ensureUnique($table, $column, $value, $modelClass, $model);
                 }
-                
+
                 $record[$column] = $value;
             }
         }
 
-        // Segunda pasada: generar claves foráneas
+        // Luego generar foreign keys
         foreach ($columns as $column) {
             if (Str::endsWith($column, '_id')) {
-                $foreignKey = $this->generateValueForColumn($modelClass, $column, $model);
-                
-                // Si es null y la columna es NOT NULL, intentar generar dependencia
-                if ($foreignKey === null) {
-                    $relationName = Str::camel(Str::beforeLast($column, '_id'));
-                    if (method_exists($model, $relationName)) {
-                        try {
-                            $relation = $model->$relationName();
-                            $relatedClass = get_class($relation->getRelated());
-                            
-                            // Generar dependencias si no existen
-                            if (!isset($this->generatedIds[$relatedClass]) || empty($this->generatedIds[$relatedClass])) {
-                                if (!isset($generatedForRelations[$relatedClass])) {
-                                    $this->info("  ↳ Generando registros para " . class_basename($relatedClass) . " (dependencia requerida)...");
-                                    $this->insertRecords($relatedClass, 5);
-                                    $generatedForRelations[$relatedClass] = true;
-                                }
-                            }
-                            
-                            // Intentar obtener ID nuevamente
-                            if (isset($this->generatedIds[$relatedClass]) && !empty($this->generatedIds[$relatedClass])) {
-                                $foreignKey = $this->faker->randomElement($this->generatedIds[$relatedClass]);
-                            }
-                        } catch (\Exception $e) {
-                            // No se pudo generar
-                        }
-                    }
-                }
-                
+                $foreignKey = $this->generateForeignKey($modelClass, $column, $model, $generatedForRelations);
                 $record[$column] = $foreignKey;
             }
         }
 
-        // Agregar timestamps
         $record['created_at'] = now();
         $record['updated_at'] = now();
 
@@ -418,185 +435,268 @@ class MakeSmartSeed extends Command
     }
 
     /**
-     * Genera valor para una columna específica
+     * Sistema inteligente de generación de valores basado en patrones
      */
     protected function generateValueForColumn(string $modelClass, string $column, $model)
     {
-        // Detectar relaciones (columnas _id)
         if (Str::endsWith($column, '_id')) {
-            return $this->generateForeignKey($modelClass, $column, $model);
+            return null; // Manejado por generateForeignKey
         }
 
-        $columnType = Schema::getColumnType($model->getTable(), $column);
+        $columnLower = strtolower($column);
 
-        // Generar por nombre de columna
-        $value = $this->generateByColumnName($column);
-        if ($value !== null) {
-            return $value;
+        // 1. Buscar coincidencia exacta (máxima prioridad)
+        if (isset($this->columnPatterns['exact'][$columnLower])) {
+            return $this->generateFromPattern($this->columnPatterns['exact'][$columnLower]);
         }
 
-        // Generar por tipo de dato
+        // 2. Buscar por sufijos
+        foreach ($this->columnPatterns['suffix'] as $suffix => $pattern) {
+            if (Str::endsWith($columnLower, $suffix)) {
+                return $this->generateFromPattern($pattern);
+            }
+        }
+
+        // 3. Buscar por prefijos
+        foreach ($this->columnPatterns['prefix'] as $prefix => $pattern) {
+            if (Str::startsWith($columnLower, $prefix)) {
+                return $this->generateFromPattern($pattern);
+            }
+        }
+
+        // 4. Buscar por palabra clave contenida
+        foreach ($this->columnPatterns['contains'] as $keyword => $pattern) {
+            if (Str::contains($columnLower, $keyword)) {
+                return $this->generateFromPattern($pattern);
+            }
+        }
+
+        // 5. Fallback: generar por tipo de columna
+        $columnType = $this->getColumnType($model->getTable(), $column);
+
         return $this->generateByColumnType($columnType, $column);
     }
 
     /**
-     * Genera valor basado en el nombre de la columna
+     * Genera valor desde un patrón definido
      */
-    protected function generateByColumnName(string $column)
+    protected function generateFromPattern(array $pattern)
     {
-        $columnLower = strtolower($column);
+        return match ($pattern['type']) {
+            'datetime' => $this->faker->dateTimeBetween(
+                $pattern['range'][0] ?? '-1 year',
+                $pattern['range'][1] ?? 'now'
+            )->format('Y-m-d H:i:s'),
 
-        // Patrones específicos primero (más específicos a menos específicos)
-        $patterns = [
-            'email_verified_at' => fn() => $this->faker->dateTimeBetween('-1 year', 'now'),
-            'firstname' => fn() => $this->faker->firstName(),
-            'lastname' => fn() => $this->faker->lastName(),
-            'first_name' => fn() => $this->faker->firstName(),
-            'last_name' => fn() => $this->faker->lastName(),
-            'birth_date' => fn() => $this->faker->date('Y-m-d', '-18 years'),
-            'start_date' => fn() => $this->faker->date(),
-            'end_date' => fn() => $this->faker->date(),
-            'published_at' => fn() => $this->faker->dateTimeBetween('-1 year', 'now'),
-            'verified_at' => fn() => $this->faker->dateTimeBetween('-1 year', 'now'),
-            'email' => fn() => $this->faker->unique()->safeEmail(),
-            'password' => fn() => bcrypt('password'),
-            'username' => fn() => $this->faker->userName(),
-            'phone' => fn() => $this->faker->phoneNumber(),
-            'address' => fn() => $this->faker->address(),
-            'city' => fn() => $this->faker->city(),
-            'country' => fn() => $this->faker->country(),
-            'postal_code' => fn() => $this->faker->postcode(),
-            'zip_code' => fn() => $this->faker->postcode(),
-            'title' => fn() => $this->faker->sentence(4),
-            'slug' => fn() => $this->faker->slug(),
-            'description' => fn() => $this->faker->paragraph(),
-            'content' => fn() => $this->faker->paragraphs(3, true),
-            'body' => fn() => $this->faker->paragraphs(5, true),
-            'text' => fn() => $this->faker->paragraph(),
-            'url' => fn() => $this->faker->url(),
-            'website' => fn() => $this->faker->url(),
-            'image' => fn() => $this->faker->imageUrl(640, 480),
-            'avatar' => fn() => $this->faker->imageUrl(200, 200, 'people'),
-            'photo' => fn() => $this->faker->imageUrl(),
-            'price' => fn() => $this->faker->randomFloat(2, 10, 1000),
-            'amount' => fn() => $this->faker->randomFloat(2, 0, 10000),
-            'quantity' => fn() => $this->faker->numberBetween(1, 100),
-            'stock' => fn() => $this->faker->numberBetween(0, 500),
-            'status' => fn() => $this->faker->randomElement(['active', 'inactive', 'pending']),
-            'type' => fn() => $this->faker->word(),
-            'name' => fn() => $this->faker->name(),
-            'token' => fn() => Str::random(60),
-            'code' => fn() => strtoupper($this->faker->bothify('???-###')),
-            'color' => fn() => $this->faker->hexColor(),
-            'ip' => fn() => $this->faker->ipv4(),
-            'latitude' => fn() => $this->faker->latitude(),
-            'longitude' => fn() => $this->faker->longitude(),
-        ];
+            'date' => $this->faker->date('Y-m-d', $pattern['max'] ?? 'now'),
+            'time' => $this->faker->time('H:i:s'),
+            'year' => $this->faker->year(),
 
-        // Buscar coincidencia exacta primero
-        if (isset($patterns[$columnLower])) {
-            return $patterns[$columnLower]();
-        }
+            'email' => $this->faker->unique()->safeEmail(),
+            'username' => $this->faker->unique()->userName(),
+            'slug' => $this->faker->unique()->slug(),
+            'name' => $this->faker->name(),
+            'title' => $this->faker->sentence(4),
 
-        // Luego buscar patrones que contengan
-        foreach ($patterns as $pattern => $generator) {
-            if (Str::contains($columnLower, $pattern)) {
-                return $generator();
-            }
-        }
+            'phone' => $this->faker->phoneNumber(),
+            'address' => $this->faker->address(),
+            'street' => $this->faker->streetAddress(),
+            'city' => $this->faker->city(),
+            'state' => $this->faker->state(),
+            'country' => $this->faker->country(),
+            'postcode' => $this->faker->postcode(),
 
-        // Patrones booleanos
-        if (Str::startsWith($columnLower, ['is_', 'has_', 'can_', 'should_'])) {
-            return $this->faker->boolean();
-        }
+            'paragraph' => $this->faker->paragraph(),
+            'text' => $this->faker->paragraphs($pattern['paragraphs'] ?? 3, true),
 
-        // Patrones de fecha
-        if (Str::endsWith($columnLower, ['_at', '_date'])) {
-            return $this->faker->dateTimeBetween('-1 year', 'now');
-        }
+            'url' => $this->faker->url(),
+            'image' => $this->faker->imageUrl(
+                $pattern['width'] ?? 640,
+                $pattern['height'] ?? 480,
+                $pattern['category'] ?? null
+            ),
 
-        return null;
+            'boolean' => $this->faker->boolean(),
+
+            'integer' => $this->faker->numberBetween(
+                $pattern['min'] ?? 1,
+                $pattern['max'] ?? 100
+            ),
+
+            'float' => $this->faker->randomFloat(
+                $pattern['decimals'] ?? 2,
+                $pattern['min'] ?? 0,
+                $pattern['max'] ?? 1000
+            ),
+
+            'enum' => $this->faker->randomElement($pattern['values'] ?? ['option1', 'option2', 'option3']),
+
+            'uuid' => $this->faker->uuid(),
+            'color' => $this->faker->hexColor(),
+            'ip' => $this->faker->ipv4(),
+            'latitude' => $this->faker->latitude(),
+            'longitude' => $this->faker->longitude(),
+
+            'company' => $this->faker->company(),
+            'job_title' => $this->faker->jobTitle(),
+
+            'locale' => $this->faker->locale(),
+            'language_code' => $this->faker->languageCode(),
+            'timezone' => $this->faker->timezone(),
+            'currency' => $this->faker->currencyCode(),
+
+            'bcrypt' => bcrypt($pattern['value'] ?? 'password'),
+
+            'string' => Str::random($pattern['length'] ?? 60),
+            'numeric' => $this->faker->numerify($pattern['pattern'] ?? '######'),
+            'alphanumeric' => strtoupper($this->faker->bothify($pattern['pattern'] ?? '???-###')),
+            'reference' => strtoupper($this->faker->bothify(($pattern['prefix'] ?? 'REF').'-########')),
+
+            default => $this->faker->word(),
+        };
     }
 
-    /**
-     * Genera valor basado en el tipo de columna
-     */
+    protected function getColumnType(string $table, string $column): string
+    {
+        try {
+            $type = Schema::getColumnType($table, $column);
+
+            $typeMap = [
+                'bigint' => 'biginteger',
+                'int' => 'integer',
+                'varchar' => 'string',
+                'tinyint' => 'tinyinteger',
+                'smallint' => 'smallinteger',
+                'mediumint' => 'mediuminteger',
+            ];
+
+            return $typeMap[$type] ?? $type;
+        } catch (\Exception $e) {
+            return 'string';
+        }
+    }
+
     protected function generateByColumnType(string $type, string $column)
     {
-        return match ($type) {
-            'string', 'text', 'char', 'varchar' => $this->faker->sentence(),
-            'integer', 'bigint', 'smallint', 'tinyint' => $this->faker->numberBetween(1, 100),
-            'float', 'double', 'decimal' => $this->faker->randomFloat(2, 0, 1000),
-            'boolean' => $this->faker->boolean(),
-            'date' => $this->faker->date(),
-            'datetime', 'timestamp' => $this->faker->dateTime(),
-            'time' => $this->faker->time(),
-            'json' => json_encode(['key' => $this->faker->word()]),
+        return match (strtolower($type)) {
+            'string', 'char', 'varchar' => $this->faker->sentence(3),
+            'text', 'tinytext', 'mediumtext', 'longtext' => $this->faker->paragraph(),
+            'integer', 'int', 'bigint', 'biginteger' => $this->faker->numberBetween(1, 100000),
+            'tinyint', 'tinyinteger' => $this->faker->numberBetween(1, 127),
+            'smallint', 'smallinteger' => $this->faker->numberBetween(1, 32767),
+            'mediumint', 'mediuminteger' => $this->faker->numberBetween(1, 8388607),
+            'float', 'double', 'real' => $this->faker->randomFloat(2, 0, 10000),
+            'decimal', 'numeric' => $this->faker->randomFloat(2, 0, 99999),
+            'boolean', 'bool', 'tinyint(1)' => $this->faker->boolean(),
+            'date' => $this->faker->date('Y-m-d'),
+            'datetime', 'timestamp' => $this->faker->dateTime()->format('Y-m-d H:i:s'),
+            'time' => $this->faker->time('H:i:s'),
+            'year' => $this->faker->year(),
+            'json', 'jsonb' => json_encode(['key' => $this->faker->word(), 'value' => $this->faker->sentence()]),
+            'binary', 'blob' => base64_encode($this->faker->text(50)),
+            'uuid' => $this->faker->uuid(),
+            'enum' => $this->faker->randomElement(['option1', 'option2', 'option3']),
+            'set' => 'value1,value2',
+            'geometry', 'point', 'linestring', 'polygon' => DB::raw("ST_GeomFromText('POINT({$this->faker->longitude()} {$this->faker->latitude()})')"),
+            'geography' => DB::raw("ST_GeographyFromText('SRID=4326;POINT({$this->faker->longitude()} {$this->faker->latitude()})')"),
+            'ipaddress', 'ip' => $this->faker->ipv4(),
+            'macaddress', 'mac' => $this->faker->macAddress(),
             default => $this->faker->word(),
         };
     }
 
     /**
-     * Genera clave foránea válida
+     * Verifica si un campo requiere valores únicos
      */
-    protected function generateForeignKey(string $modelClass, string $column, $model)
+    protected function requiresUniqueness(string $column): bool
+    {
+        $columnLower = strtolower($column);
+
+        foreach ($this->columnPatterns['contains'] as $keyword => $pattern) {
+            if (Str::contains($columnLower, $keyword) && isset($pattern['unique']) && $pattern['unique']) {
+                return true;
+            }
+        }
+
+        return in_array($columnLower, ['email', 'username', 'slug']);
+    }
+
+    /**
+     * Asegura que un valor sea único
+     */
+    protected function ensureUnique(string $table, string $column, $value, string $modelClass, $model): mixed
+    {
+        $attempts = 0;
+
+        while (isset($this->uniqueValues[$table][$column][$value]) && $attempts < 10) {
+            $value = $this->generateValueForColumn($modelClass, $column, $model);
+            $attempts++;
+        }
+
+        $this->uniqueValues[$table][$column][$value] = true;
+
+        return $value;
+    }
+
+    protected function generateForeignKey(string $modelClass, string $column, $model, array &$generatedForRelations)
     {
         $relationName = Str::camel(Str::beforeLast($column, '_id'));
 
-        if (!method_exists($model, $relationName)) {
-            // Si no hay método de relación, intentar obtener IDs de la tabla relacionada
+        if (! method_exists($model, $relationName)) {
             $relatedTable = Str::plural(Str::beforeLast($column, '_id'));
             if (Schema::hasTable($relatedTable)) {
                 $ids = DB::table($relatedTable)->pluck('id')->toArray();
-                if (!empty($ids)) {
+                if (! empty($ids)) {
                     return $this->faker->randomElement($ids);
                 }
             }
-            
-            // Si no encuentra nada, devolver 1 como fallback
+
             return 1;
         }
 
         try {
             $relation = $model->$relationName();
-            
-            // Verificar que sea una relación válida de Eloquent
-            if (!($relation instanceof \Illuminate\Database\Eloquent\Relations\Relation)) {
+
+            if (! ($relation instanceof \Illuminate\Database\Eloquent\Relations\Relation)) {
                 return 1;
             }
-            
+
             $relatedClass = get_class($relation->getRelated());
 
-            // Si ya tenemos IDs generados, usar uno
-            if (isset($this->generatedIds[$relatedClass]) && !empty($this->generatedIds[$relatedClass])) {
+            if (isset($this->generatedIds[$relatedClass]) && ! empty($this->generatedIds[$relatedClass])) {
                 return $this->faker->randomElement($this->generatedIds[$relatedClass]);
             }
 
-            // Si no, obtener de la base de datos
             $relatedModel = new $relatedClass;
             $relatedTable = $relatedModel->getTable();
-            
+
             if (Schema::hasTable($relatedTable)) {
                 $relatedIds = DB::table($relatedTable)->pluck('id')->toArray();
 
-                if (!empty($relatedIds)) {
+                if (! empty($relatedIds)) {
                     $this->generatedIds[$relatedClass] = $relatedIds;
+
                     return $this->faker->randomElement($relatedIds);
                 }
             }
 
-            // Si llegamos aquí y no hay registros, devolver null
-            // El método que llama decidirá si necesita generar dependencias
+            if (! isset($generatedForRelations[$relatedClass])) {
+                $this->info('  ↳ Generando registros para '.class_basename($relatedClass).' (dependencia requerida)...');
+                $this->insertRecords($relatedClass, 5);
+                $generatedForRelations[$relatedClass] = true;
+
+                if (isset($this->generatedIds[$relatedClass]) && ! empty($this->generatedIds[$relatedClass])) {
+                    return $this->faker->randomElement($this->generatedIds[$relatedClass]);
+                }
+            }
+
             return null;
-            
+
         } catch (\Exception $e) {
             return 1;
         }
     }
 
-    /**
-     * Genera relaciones para tablas pivote
-     */
     protected function generatePivotsForModel(string $modelClass)
     {
         $model = new $modelClass;
@@ -604,18 +704,16 @@ class MakeSmartSeed extends Command
         $methods = $reflection->getMethods(ReflectionMethod::IS_PUBLIC);
 
         foreach ($methods as $method) {
-            // Saltar métodos que no son del modelo actual o tienen parámetros
             if ($method->class !== $modelClass || $method->getNumberOfParameters() > 0) {
                 continue;
             }
 
-            // Saltar métodos conocidos que no son relaciones
             $skipMethods = [
                 'getConnectionName', 'getConnection', 'getTable', 'getKeyName',
                 'getKey', 'getRouteKey', 'getRouteKeyName', 'getFillable',
                 'getGuarded', 'getCasts', 'getDates', 'getHidden', 'getVisible',
                 'toArray', 'toJson', 'jsonSerialize', 'fresh', 'refresh',
-                'getAttribute', 'setAttribute', 'boot', 'booted', 'bootIfNotBooted'
+                'getAttribute', 'setAttribute', 'boot', 'booted', 'bootIfNotBooted',
             ];
 
             if (in_array($method->name, $skipMethods)) {
@@ -625,26 +723,21 @@ class MakeSmartSeed extends Command
             try {
                 $relation = $method->invoke($model);
 
-                // Verificar que sea realmente una relación BelongsToMany
                 if ($relation instanceof \Illuminate\Database\Eloquent\Relations\BelongsToMany) {
                     $this->generateBelongsToManyRecords($modelClass, $method->name, $relation);
                 }
             } catch (\Throwable $e) {
-                // No es una relación válida o error al invocar, continuar
                 continue;
             }
         }
     }
 
-    /**
-     * Genera registros para relación BelongsToMany
-     */
     protected function generateBelongsToManyRecords(string $modelClass, string $relationName, $relation)
     {
         $pivotTable = $relation->getTable();
         $foreignPivotKey = $relation->getForeignPivotKeyName();
         $relatedPivotKey = $relation->getRelatedPivotKeyName();
-        
+
         $relatedClass = get_class($relation->getRelated());
 
         $parentIds = $this->generatedIds[$modelClass] ?? DB::table((new $modelClass)->getTable())->pluck('id')->toArray();
@@ -657,7 +750,7 @@ class MakeSmartSeed extends Command
         $pivotRecords = [];
         $existingPairs = DB::table($pivotTable)
             ->get([$foreignPivotKey, $relatedPivotKey])
-            ->map(fn($row) => "{$row->$foreignPivotKey}-{$row->$relatedPivotKey}")
+            ->map(fn ($row) => "{$row->$foreignPivotKey}-{$row->$relatedPivotKey}")
             ->toArray();
 
         foreach ($parentIds as $parentId) {
@@ -666,8 +759,8 @@ class MakeSmartSeed extends Command
 
             foreach ($selectedRelatedIds as $relatedId) {
                 $pairKey = "{$parentId}-{$relatedId}";
-                
-                if (!in_array($pairKey, $existingPairs)) {
+
+                if (! in_array($pairKey, $existingPairs)) {
                     $pivotRecords[] = [
                         $foreignPivotKey => $parentId,
                         $relatedPivotKey => $relatedId,
@@ -679,29 +772,23 @@ class MakeSmartSeed extends Command
             }
         }
 
-        if (!empty($pivotRecords)) {
+        if (! empty($pivotRecords)) {
             DB::table($pivotTable)->insert($pivotRecords);
-            $this->info("✅ Se generaron " . count($pivotRecords) . " relaciones en {$pivotTable}");
+            $this->info('✅ Se generaron '.count($pivotRecords)." relaciones en {$pivotTable}");
         }
     }
 
-    /**
-     * Genera solo relaciones pivote
-     */
     protected function generateOnlyPivots()
     {
         $this->info("🔗 Generando solo relaciones en tablas pivote...\n");
-        
+
         $models = $this->getAllModels();
-        
+
         foreach ($models as $modelClass) {
             $this->generatePivotsForModel($modelClass);
         }
     }
 
-    /**
-     * Trunca tabla de un modelo
-     */
     protected function truncateModel(string $modelClass)
     {
         $model = new $modelClass;
@@ -714,12 +801,9 @@ class MakeSmartSeed extends Command
         }
     }
 
-    /**
-     * Obtiene la clase completa del modelo
-     */
     protected function getModelClass(string $modelName): ?string
     {
-        $modelClass = 'App\\Models\\' . $modelName;
+        $modelClass = 'App\\Models\\'.$modelName;
 
         if (class_exists($modelClass)) {
             return $modelClass;
