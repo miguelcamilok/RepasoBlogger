@@ -3,6 +3,7 @@
 namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Str;
 
@@ -50,55 +51,63 @@ class AutoProduce extends Command
     private function step1_CheckMakeSmartModels()
     {
         $commandPath = app_path('Console/Commands/MakeSmartModels.php');
-        require_once $commandPath;
 
         if (!File::exists($commandPath)) {
             $this->warn('⚠️  Comando MakeSmartModels no encontrado. Creando automáticamente...');
 
-            // Asegurar directorio
             if (!File::isDirectory(app_path('Console/Commands'))) {
                 File::makeDirectory(app_path('Console/Commands'), 0755, true);
             }
 
-            // Obtener contenido del stub
             $stubContent = $this->getMakeSmartModelsStub();
-
-            // Guardar el archivo
             File::put($commandPath, $stubContent);
 
             $this->info("✅ MakeSmartModels creado automáticamente en: {$commandPath}");
+
+            // 🔥 Recargar para que el comando exista enseguida
+            Artisan::call('optimize:clear');
+            shell_exec('composer dump-autoload');
         } else {
             $this->info('✅ Comando MakeSmartModels encontrado.');
         }
     }
 
-
     private function step2_ExecuteMakeSmartModels()
     {
         $this->info('🔧 Ejecutando MakeSmartModels...');
 
-        // Verificar si ya existen modelos
-        $modelsExist = $this->checkIfModelsExist();
+        $command = 'php artisan make:smart-models';
+        $params = [];
 
+        // Si existen modelos y no está el flag --force
+        $modelsExist = $this->checkIfModelsExist();
         if ($modelsExist && !$this->option('force')) {
-            if ($this->confirm('Se detectaron modelos existentes. ¿Deseas sobrescribirlos?', false)) {
-                $this->call('make:smart-models', ['--overwrite' => true]);
-            } else {
+            if (!$this->confirm('Se detectaron modelos existentes. ¿Deseas sobrescribirlos?', false)) {
                 $this->info('ℹ️  No se sobreescribieron los modelos.');
+                return;
             }
+            $params[] = '--overwrite';
         } else {
-            $params = [];
             if ($this->option('force')) {
-                $params['--overwrite'] = true;
+                $params[] = '--overwrite';
             }
-            $this->call('make:smart-models', $params);
         }
 
+        // Construir comando con parámetros
+        if (!empty($params)) {
+            $command .= ' ' . implode(' ', array_map(fn($p) => $p, $params));
+        }
+
+        // Ejecución en NUEVO proceso (clave para Laravel 12)
+        $this->info("▶️ Ejecutando: $command");
+        passthru($command);
 
         // Obtener lista de modelos creados
         $this->modelsCreated = $this->getCreatedModels();
         $this->info('✅ MakeSmartModels ejecutado. Modelos detectados: ' . count($this->modelsCreated));
     }
+
+
 
     private function step3_DetectOneToOneRelations()
     {
@@ -282,34 +291,40 @@ class AutoProduce extends Command
             return;
         }
 
-        // Asegurar directorio
+        // Crear directorio si no existe
         if (!File::isDirectory(app_path('Console/Commands'))) {
             File::makeDirectory(app_path('Console/Commands'), 0755, true);
         }
 
-        // Obtener contenido del stub
-        $stubContent = $this->getMakeSmartSeedStub();
-
-        // Guardar el archivo
-        File::put($commandPath, $stubContent);
+        // Escribir stub
+        File::put($commandPath, $this->getMakeSmartSeedStub());
 
         $this->info("✅ MakeSmartSeed creado en: {$commandPath}");
         $this->warn('⚠️  IMPORTANTE: Debes implementar los métodos del seeder manualmente.');
+
+        // Recargar para que el comando exista enseguida
+        Artisan::call('optimize:clear');
+        shell_exec('composer dump-autoload');
     }
+
 
     private function step8_ExecuteMakeSmartSeed()
     {
         $this->info('🔧 Ejecutando MakeSmartSeed...');
 
-        if ($this->confirm('¿Deseas ejecutar los datos de prueba?', false)) {
-            $this->call('make:smart-seed');
-        } else {
+        if (!$this->confirm('¿Deseas ejecutar los datos de prueba?', false)) {
             $this->info('ℹ️  No se ejecutaron los datos de prueba.');
             $this->warn('⚠️  Recuerda ejecutar MakeSmartSeed manualmente cuando lo necesites.');
+            return;
         }
+
+        // Llamar en nuevo proceso para que Laravel registre el comando correctamente
+        $this->info('▶️ Ejecutando: php artisan make:smart-seed');
+        passthru('php artisan make:smart-seed');
 
         $this->info('✅ MakeSmartSeed ejecutado.');
     }
+
 
 
     private function showFinalSummary()
@@ -2265,7 +2280,7 @@ PHP;
     private function getMakeSmartSeedStub()
     {
         return <<<'PHP'
-    <?php
+<?php
 
 namespace App\Console\Commands;
 
